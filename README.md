@@ -6,7 +6,7 @@ It supports multiple PDF uploads per session, persona-aware retrieval, a Cross-E
 
 Design principle (explainability):
 "A persona-aware document intelligence system using hybrid RAG with a trained neural relevance model and optional generation."
-
+Live Demo Link - https://persona-pdf-analyser.streamlit.app/
 ## Folder structure
 
 - app.py
