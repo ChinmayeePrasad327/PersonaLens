@@ -1,8 +1,8 @@
-# generator.py (UPDATED GROQ VERSION)
+
 import os
 from groq import Groq
 from dotenv import load_dotenv
-from personas import get_persona_prompt
+from personas import get_persona_data
 
 load_dotenv()
 
@@ -13,40 +13,63 @@ if not api_key:
 
 client = Groq(api_key=api_key)
 
-def generate_response(chunks, persona_key, user_query):
-    persona_info = get_persona_prompt(persona_key)
+def generate_response(chunks, main_p, sub_p, user_query=None):
+    """
+    Generates a response using Groq (Llama 3.3).
+    - If user_query is provided: Answers the specific question.
+    - If user_query is empty/None: Generates a comprehensive summary based on the persona.
+    """
     
-    # Context
+    # Fetch persona details
+    persona_info = get_persona_data(main_p, sub_p)
+    
+    # Context Construction
+    # (Since chunks can come from multiple PDFs in the vector store, 
+    # this implicitly handles multi-PDF context)
     context_text = "\n\n".join([c["chunk"] for c in chunks])
     
-    # System Prompt (Persona)
+    # --- LOGIC FOR EMPTY QUERY (AUTO-SUMMARY) ---
+    if not user_query or user_query.strip() == "":
+        # Default instruction if no query is given
+        task_specific_instruction = (
+            "The user has not asked a specific question. "
+            "Your task is to analyze the provided document content and generate a comprehensive summary. "
+            "Highlight the main points, key themes, and conclusions relevant to your persona."
+        )
+        display_query = "Summarize the key points of the uploaded document(s)."
+    else:
+        # Instruction for specific questions
+        task_specific_instruction = "Answer the user's specific question based strictly on the context provided."
+        display_query = user_query
+
+    # System Prompt
     system_prompt = f"""
-    You are an expert acting as: {persona_key}.
+    Role: You are an expert acting as a {main_p} with a focus on {sub_p}.
     Goal: {persona_info['intent']}
-    Style: {persona_info['prompt_style']}
+    Style Guide: {persona_info['prompt_style']}
     
     INSTRUCTIONS:
-    1. Answer ONLY using the provided Context.
-    2. If the answer is missing, say "Information not found."
-    3. Be concise and professional.
+    1. {task_specific_instruction}
+    2. Answer ONLY using the provided Context below.
+    3. If the context contains information from multiple documents, synthesize them into a cohesive response.
+    4. If the answer is missing in the text, say "Information not found."
     """
     
     # User Prompt
     user_prompt = f"""
-    Context:
+    Context from Document(s):
     {context_text}
     
-    Question: {user_query}
+    User Request: {display_query}
     """
 
     try:
-        # 2. Call Groq with the NEW Model Name
+        # Call Groq API
         chat_completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            # UPDATED MODEL NAME BELOW:
             model="llama-3.3-70b-versatile", 
             temperature=0.5,
         )
