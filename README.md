@@ -1,4 +1,3 @@
-```markdown
 # PersonaLens – Persona-Based Intelligent PDF Understanding System
 
 A hackathon-ready prototype of PersonaLens: a persona-aware, hybrid RAG system with a trained neural relevance model (SLM).  
