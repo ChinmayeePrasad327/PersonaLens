@@ -31,6 +31,15 @@
 
 Everything else (multi-document chat, collections, custom personas, briefs, summaries, quizzes, flashcards, comparison, research assistant, DOCX/CSV/PDF export, and a fallback provider) is listed in §12 with its added cost.
 
+### Free-tier constraints (official sources, checked 2026-11-12; re-verified before deployment)
+
+| Service | Constraint | Design consequence |
+|---|---|---|
+| **Render Free** web service ([compute plans](https://render.com/docs/compute-plans), [free](https://render.com/docs/free), [pricing](https://render.com/pricing)) | **0.1 CPU, 512 MB RAM.** Spins down after 15 minutes without traffic, about 1 minute to wake. Ephemeral filesystem. May restart at any time. 750 instance-hours per month per workspace. | The resource benchmark is a **hard go/no-go gate** (§9). Nothing durable lives on local disk. Processing is recoverable (§5). |
+| **LLM provider** (for example Groq; [rate limits](https://console.groq.com/docs/rate-limits)) | Limits are **organisation-level, shared by every app user on the same key**. Groq's base limits for `openai/gpt-oss-120b` and `gpt-oss-20b` show 30 RPM, 1K RPD, 8K TPM and 200K TPD. The account Limits page is authoritative. | A **shared global limiter** per key (requests per minute, tokens per minute, requests per day, tokens per day) with headroom, enforced before any per-user limit (§7). |
+| **Supabase Free** ([pricing](https://supabase.com/pricing), [pausing](https://supabase.com/docs/guides/platform/free-project-pausing)) | 500 MB database, 1 GB file storage and **5 GB egress**, all project-wide and shared by all users. Projects are paused after about 7 days of low activity, and can be restored from the dashboard for up to 1 year with data intact. | Global guards on database size, Storage and egress (§4). The deployment guide covers keeping the project active and how to resume it. |
+| **Vercel Hobby** ([terms §4](https://vercel.com/legal/terms)) | "only … for your personal or non-commercial use." | The frontend is a **static site only**: no Vercel functions, and PDF contents never pass through Vercel. Valid only while PersonaLens remains a personal, non-commercial portfolio project. |
+
 ## 3. System overview
 
 ```
@@ -92,6 +101,7 @@ Supabase Free gives **1 GB of Storage and 500 MB of database per project, shared
 | Max documents per user | 5 | 5 × 10 MB = 50 MB worst case per user |
 | Project Storage guard | 800 MB (80% of 1 GB) | Uploads are refused with a visible "Storage is full for this demo" error |
 | Project database guard | 400 MB (80% of 500 MB) | Same, measured with `pg_database_size` |
+| Project egress guard | 4 GB per month (80% of 5 GB) | Each signed-URL PDF view is counted by file size, and the viewer caches the PDF for the session so it is downloaded once. Above the guard, viewing shows "Viewer paused: monthly bandwidth limit reached", while Q&A on stored chunks keeps working. |
 
 Deleting a document removes the Storage object, its chunks, conversations and messages in one transaction, and a cleanup task removes orphaned objects. Duplicate uploads (same `sha256` for the same user) are rejected.
 
@@ -154,7 +164,7 @@ The ledger reserves 2,800 tokens before each call, settles to the provider's rep
 
 ### Global and per-user limits
 
-- **Global cap.** `global_daily_tokens = floor(0.6 × D)`, where D is the lowest *verified* daily token limit for the chosen model, read from the account console and not from docs. The 40% headroom covers retries, settlement drift and limit changes. A per-minute cap works the same way, at 60% of the verified per-minute limit.
+- **Shared global limiter.** Provider limits apply to the whole organisation and API key, not per app user, so one limiter in Postgres covers all users. It enforces 60% of each *verified* account limit: tokens per day, requests per day, tokens per minute and requests per minute. The 40% headroom covers retries, settlement drift, limit changes and any other use of the same key. It is checked before every call, ahead of the per-user limit.
 - **Per-user limit** (default 15 questions per day) only stops one user from using up the shared pool. It is **not** a capacity guarantee, and the UI does not present it as one.
 - **No advertised capacity until it is measured.** After Milestone 3 the README states "expected daily answers = global cap ÷ measured p95 tokens per answer", with the measurement date and the verified limits it is based on.
 - **Kill switch.** `AI_ENABLED` (environment) and `app_settings.ai_enabled` (database) disable generation immediately.
@@ -199,13 +209,28 @@ Until the gate is passed, development uses a fake provider in tests. Real calls 
 
 ## 9. Resource limits on free hosting
 
-Render Free has an ephemeral filesystem and spins down after 15 minutes idle, with a cold start of about 1 minute. Its RAM and CPU are not stated on its free-tier page, so Milestone 2 reads them from the actual service. The backend must fit them with headroom. Bounds:
+Render Free has an ephemeral filesystem and spins down after 15 minutes idle, with a cold start of about 1 minute. The instance has **0.1 CPU and 512 MB RAM** (§2). FastAPI, OCR and a PyTorch-based Sentence Transformer may not fit in that, or may run far too slowly, so nothing is assumed.
+
+**Go/no-go gate (Milestone 2, on a real Render Free instance).** Pass means all of these hold:
+- Peak RSS stays at or below about 400 MB, which leaves headroom under 512 MB, through a full upload, processing and question run.
+- Processing a 20-page text PDF finishes within 2 minutes.
+- p95 question latency, excluding LLM time, is 3 seconds or less.
+- No out-of-memory restarts occur during the workload test.
+
+If the gate fails, **simplify. Never upgrade.** Step down in this order and re-measure after each step:
+1. Replace the PyTorch embedder with an ONNX Runtime build of the same model, and keep the reranker off.
+2. Use pgvector in Postgres so no vectors are held in RAM.
+3. Turn OCR off on the hosted demo. Scanned PDFs then show "OCR available in the local demo only", and the full pipeline runs locally.
+4. **Retrieval-only hosted demo:** no local model at all on Render. The hosted demo uses Postgres full-text retrieval only, with grounded answers and citations still produced from those passages. Semantic and hybrid retrieval run in the local demo.
+
+The hosted configuration that passes, and its measurements, are recorded in the Milestone 2 PR and the README.
+
+Bounds that apply in every case:
 
 - **Models:** lazy-loaded, one embedding model, reranker off by default, CPU-only builds, and no model downloads at request time (they are baked into the image at build).
 - **OCR:** 20 pages, 150 DPI, 20 seconds per page, and one document processed at a time.
 - **Concurrency:** one processing worker and a small request pool, so a large upload cannot starve Q&A.
 - **Cold start:** the UI shows a "Waking up the demo server…" state when `/health` is slow, instead of failing.
-- **If it does not fit,** step down in this order: switch to the ONNX embedder, keep the reranker off, use pgvector search so no vectors are held in RAM, then lower the OCR and page caps. Never upgrade the plan.
 
 ## 10. Testing and acceptance
 
@@ -225,6 +250,7 @@ Render Free has an ephemeral filesystem and spins down after 15 minutes idle, wi
   - behaviour under forced 429s and quota exhaustion.
 
   It runs locally in Milestones 2–3, and again against the deployed free services in Milestone 7.
+- **Deployment guide (Milestone 7, `docs/DEPLOYMENT.md`)** cites the free-tier constraints in §2 with links, records the date they were re-verified, and covers Supabase pausing and resuming, Render cold starts, and the Vercel Hobby non-commercial restriction. Every step works without a payment method.
 - **Deployment acceptance (Milestone 7):** the deployed app passes the smoke test and the isolation suite. The workload results are attached to the PR, and the README states expected daily capacity from measured tokens and console-confirmed limits, with the safety margin applied.
 
 ## 11. Milestones (7)
@@ -234,12 +260,12 @@ Each milestone uses its own branch from the latest `main`, has its own PR to `ma
 | # | Branch | Delivers | Exit criteria |
 |---|---|---|---|
 | 1 | `docs/m1-audit-architecture` | This audit and plan. After your approval, in the same PR: `.env.example`, a fuller `.gitignore`, a README that describes only what exists plus the local demo path, and a pytest scaffold with CI (lint and test). | CI green |
-| 2 | `feat/m2-backend-hardening` | `git mv` into `backend/app/`. Fixes the audit's C1–C3, H1, M1–M4, S3, S4 and S6. Page-aware chunk metadata, bounded OCR, upload validation, `/health`, settings, the provider adapter with typed errors (fake provider in tests), CPU-only pinned requirements and a Dockerfile with Tesseract. **Resource benchmark** of the embedder (Torch vs ONNX) and the three search options, on a free Render instance. Provider gate step 1. `ui.py` keeps working. | Tests pass; benchmark report in the PR with the chosen options |
+| 2 | `feat/m2-backend-hardening` | `git mv` into `backend/app/`. Fixes the audit's C1–C3, H1, M1–M4, S3, S4 and S6. Page-aware chunk metadata, bounded OCR, upload validation, `/health`, settings, the provider adapter with typed errors (fake provider in tests), CPU-only pinned requirements and a Dockerfile with Tesseract. **Hard go/no-go resource gate (§9)** on a real Render Free instance (0.1 CPU, 512 MB), covering the embedder (Torch vs ONNX), the three search options and OCR. Simplify per §9 until it passes. Provider gate step 1. `ui.py` keeps working. | Tests pass; benchmark report in the PR with the chosen options |
 | 3 | `feat/m3-retrieval-citations` | Keyword + semantic retrieval with RRF, optional reranker, token-capped context, citation tagging and validation, deterministic follow-ups, the 4 persona presets, and the token ledger logic. Evaluation set and **provider gate steps 2–4**. | Recall@5, citation accuracy and tokens per answer reported; provider decision recorded |
 | 4 | `feat/m4-auth-persistence-quotas` | Supabase migrations with RLS, Storage bucket and policies, JWT auth, document CRUD with the recoverable processing state machine, conversation history, Storage and database guards, global and per-user quotas, kill switch, `/usage`. | Isolation suite passes; restart-mid-processing test; quota-exhaustion test |
 | 5 | `feat/m5-frontend-foundation` | Vite + React + TypeScript, Tailwind design system, landing page, auth screens, protected routes, and the "waking up" and error states. `ui.py` is retired once Milestone 6 reaches parity. | Vitest; accessibility check; screenshots |
 | 6 | `feat/m6-library-workspace` | Library (upload with progress, status, retry, delete), workspace (PDF viewer, single-document Q&A, citations that jump to the page, passage previews, history, persona selector), usage meter and quota states, answer copy and Markdown download. **Retire `ui.py`.** | Component tests; manual run against the Milestone 4 backend |
-| 7 | `feat/m7-test-deploy` | Deploy to Render Free, Vercel Hobby and Supabase Free. Deployment guide, workload test on the deployed services, final cost and quota audit, README capacity statement and demo caveats. | Smoke test and isolation suite pass on production; workload report attached. **No deployment claim without this evidence.** |
+| 7 | `feat/m7-test-deploy` | Re-verify the §2 free-tier constraints, then deploy to Render Free (the configuration that passed the gate), Vercel Hobby (static site only) and Supabase Free. Deployment guide, workload test on the deployed services, final cost and quota audit, README capacity statement and demo caveats. | Smoke test and isolation suite pass on production; workload report attached. **No deployment claim without this evidence.** |
 
 ## 12. Future improvements (not in v2.0)
 
