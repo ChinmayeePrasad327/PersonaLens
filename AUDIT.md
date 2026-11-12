@@ -121,10 +121,10 @@ Severity: **Critical** = broken or unsafe now. **High** = blocks a 2.0 requireme
 
 ### 3.7 Deployment limitations
 
-These were checked against the providers' own pages on 2026-11-12. They will be re-checked in Milestone 10.
+These were checked against the providers' own pages on 2026-11-12. They will be re-checked in Milestone 9.
 
 - **Render free web services** have an ephemeral filesystem, lost on every restart, redeploy or spin-down. They spin down after 15 minutes idle, with a cold start of about 1 minute, and have no persistent disks ([render.com/docs/free](https://render.com/docs/free)). **Any index kept only in memory or on local disk will disappear**, so indexes must be rebuildable from Supabase.
-- **Memory is the main deployment risk.** torch, MiniLM and a Cross-Encoder together take several hundred MB of RAM. Render's free instance size is not stated on the free-tier docs page and must be confirmed. If it is the commonly cited 512 MB, this stack will not fit without changes. See `ARCHITECTURE.md` §8. Under the ₹0 rule a paid instance is not an option.
+- **Memory is the main deployment risk.** torch, MiniLM and a Cross-Encoder together take several hundred MB of RAM. Render's free instance size is not stated on the free-tier docs page and must be confirmed. If it is the commonly cited 512 MB, this stack will not fit without changes. See `ARCHITECTURE.md` §9. Under the ₹0 rule a paid instance is not an option.
 - **Supabase Free** allows 500 MB of database, 1 GB of storage, uploads up to 50 MB and 2 active projects. **Projects pause after 1 week of inactivity**, and backups are not included ([supabase.com/pricing](https://supabase.com/pricing)). Storing 384-dimensional embeddings costs about 1.5 KB per chunk, which comfortably fits a demo.
 - Tesseract must be installed in the Render image, which means a Docker deploy or a build script.
 
@@ -148,9 +148,9 @@ These were checked against the providers' own pages on 2026-11-12. They will be 
 | `vector_store.py` | **Improve** | Keep FAISS (`IndexFlatIP`), but per document and rebuildable from embeddings persisted in Supabase. Add metadata and delete. |
 | `relevance.py` | **Replace** | Replace with hybrid retrieval (FAISS + Postgres full-text), reciprocal-rank fusion, Cross-Encoder reranking and persona-aware query shaping. |
 | `personas.py` | **Preserve and extend** | Keep the data model and add the missing personas, generation parameters and custom personas. |
-| `generator.py` | **Replace the client layer, keep the prompt logic** | A provider-agnostic adapter chosen by configuration (Groq is recommended on the ₹0 analysis in `ARCHITECTURE.md` §7), typed errors instead of error strings, citation-tagged context, conversation history. |
+| `generator.py` | **Replace the client layer, keep the prompt logic** | A provider-agnostic adapter chosen by configuration (Groq is recommended on the ₹0 analysis in `ARCHITECTURE.md` §8), typed errors instead of error strings, citation-tagged context, conversation history. |
 | `app.py` | **Restructure** | Move into `backend/app/` with routers, Pydantic schemas, auth dependency, thread-pooled CPU work, and a `/health` route. |
-| `ui.py` (Streamlit) | **Keep working, then retire** | Keep it runnable against the new API until the React app reaches parity (Milestone 7), then remove it. |
+| `ui.py` (Streamlit) | **Keep working, then retire** | Keep it runnable against the new API until the React chat reaches parity (Milestone 7), then remove it. |
 | `README.md` | **Rewrite** | Describe only what exists. |
 | `requirements.txt` | **Fix** | Add `groq`, remove `openai`, pin versions, CPU-only torch. |
 
