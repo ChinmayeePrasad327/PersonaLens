@@ -1,6 +1,6 @@
 # PersonaLens 2.0 — Architecture and Milestone Plan
 
-**Status:** proposal for review, revision 3, 2026-11-12. Nothing in this document is implemented yet. See `AUDIT.md` for the current state of the code.
+**Status:** approved 2026-11-12 (revision 3). Implementation starts with Milestone 2. See `AUDIT.md` for the current state of the code.
 
 **What v2.0 is:** a small free-tier demo, not a public launch. One person (or a handful of invited users) can upload a PDF, have it processed, and ask grounded questions about it with validated page citations. Everything runs on free tiers with no payment method, card, billing account or paid plan required at any step. Cold starts, paused services, quota limits and temporary unavailability are expected and are shown honestly in the UI. The README also documents a local demo path (uvicorn plus the Vite dev server, pointed at a free Supabase project) for interviews when the hosted demo is asleep or out of quota.
 

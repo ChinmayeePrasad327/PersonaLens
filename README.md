@@ -1,110 +1,70 @@
-# PersonaLens – Persona-Based Intelligent PDF Understanding System
+# PersonaLens
 
-A hackathon-ready prototype of PersonaLens: a persona-aware, hybrid RAG system with a trained neural relevance model (SLM).  
-It supports multiple PDF uploads per session, persona-aware retrieval, a Cross-Encoder reranker trained with weak supervision, deterministic persona templates, and an optional LLM polishing step.
+PersonaLens answers questions about your PDFs from the point of view of a chosen persona, such as a student preparing for exams or a teacher planning a lesson. It extracts text from the PDF, retrieves the most relevant passages, and asks an LLM to answer using only those passages.
 
-Design principle (explainability):
-"A persona-aware document intelligence system using hybrid RAG with a trained neural relevance model and optional generation."
-Live Demo Link - https://persona-pdf-analyser.streamlit.app/
-## Folder structure
+> **Status:** this repository is the original prototype, which is being rebuilt as PersonaLens 2.0, a small free-tier demo of grounded, page-cited Q&A.
+> - [`AUDIT.md`](AUDIT.md) describes exactly what works today and what is broken.
+> - [`ARCHITECTURE.md`](ARCHITECTURE.md) is the approved v2.0 plan and its 7 milestones.
 
-- app.py
-- pdf_processor.py
-- chunker.py
-- embeddings.py
-- vector_store.py
-- personas.py
-- heuristics.py
-- train_reranker.py
-- reranker.py
-- generator.py
-- frontend/index.html
+The prototype was originally built with [Gayathri-yadla/Persona_pdf_analyser](https://github.com/Gayathri-yadla/Persona_pdf_analyser).
 
-## Quick setup
+## What the prototype contains
 
-1. Create a virtual environment and activate it:
-   - python3 -m venv venv
-   - source venv/bin/activate  (Linux/Mac) or venv\Scripts\activate (Windows)
+| File | Purpose |
+|---|---|
+| `app.py` | FastAPI backend: `POST /upload` (one PDF) and `POST /query` |
+| `ui.py` | Streamlit frontend that calls the backend at `http://localhost:8000` |
+| `pdf_processor.py` | Text extraction with pdfplumber, with a Tesseract OCR fallback for sparse pages |
+| `chunker.py` | 300-word sliding-window chunks with 50 words of overlap |
+| `embeddings.py` | `all-MiniLM-L6-v2` Sentence Transformer |
+| `vector_store.py` | In-memory FAISS index shared by every upload in the process |
+| `personas.py` | Persona hierarchy: Student, Teacher and Researcher roles with sub-personas |
+| `relevance.py` | Re-scores retrieved chunks with persona keywords and query words |
+| `generator.py` | Builds the persona prompt and calls the Groq API |
 
-2. Install dependencies:
-   - pip install -r requirements.txt
+`POST /query` takes `{"query": str, "main_persona": str, "sub_persona": str}`. An empty query produces a persona-styled summary of the top retrieved chunks.
 
-Example requirements (suggested):
-- fastapi
-- uvicorn[standard]
-- python-multipart
-- pdfplumber
-- pytesseract
-- pillow
-- sentence-transformers
-- faiss-cpu
-- torch
-- scikit-learn
-- transformers
-- cross-encoder
-- python-dotenv
-- aiofiles
+## Known limitations (see `AUDIT.md` for the full list)
 
-(You can create a `requirements.txt` with these packages. FAISS sometimes needs OS-specific install; `faiss-cpu` on pip is recommended for CPU-only.)
+- **Answers currently fail.** The Groq model hard-coded in `generator.py` (`llama-3.3-70b-versatile`) was retired on 2026-08-16, so every answer comes back as an error message. Milestone 2 fixes this.
+- **Not installable as listed.** `groq` is missing from `requirements.txt`. Install it manually for now (see below).
+- **No citations.** Chunks carry no document or page metadata, so answers cannot cite pages.
+- **Single-user only.** All uploads share one in-memory index, are lost on restart, and are visible to every user of the same backend. **Do not deploy this prototype publicly.**
 
-3. Tesseract binary:
-   - Install the Tesseract OCR engine on your system (OS package manager).
-   - Make sure `tesseract` is available in PATH.
+## Run locally
 
-4. Run the app:
-   - uvicorn app:app --reload --host 0.0.0.0 --port 8000
+Prerequisites:
+- Python 3.11 or later.
+- The [Tesseract](https://github.com/tesseract-ocr/tesseract) binary on your `PATH`, which is needed only for scanned pages.
+- A free [Groq](https://console.groq.com) API key. No payment method is needed.
 
-5. Open the demo front-end:
-   - http://localhost:8000/
-
-## Usage
-
-- POST /upload
-  - Upload one or more PDFs (form field name: `files`)
-  - Returns a `session_id` used for subsequent queries.
-
-- POST /query
-  - JSON body:
-    {
-      "session_id": "<session_id>",
-      "persona": "STUDENT",
-      "subpersona": "First Year Student",
-      "action": "generate_exam" | "summarize" | "polish",
-      "query": "optional question text",
-      "top_n": 10,
-      "top_k": 5,
-      "use_llm": false
-    }
-  - Returns deterministic persona-aware response and retrieved chunk metadata.
-
-- GET /personas
-  - Returns persona/subpersona mapping and intent descriptions.
-
-Notes:
-- Sessions are stored in-memory (hackathon-safe).
-- The SLM (Cross-Encoder) model is trained via `train_reranker.py` and saved to `models/slm`.
-- If you set an environment variable `OPENAI_API_KEY`, optional LLM polishing is enabled (OpenAI polishing is optional).
-- The system is designed to function fully without an LLM; deterministic templates are ALWAYS ON.
-
-## Files of interest
-
-- `train_reranker.py` – run this to create weak-supervised training data and train the Cross-Encoder SLM (1–3 epochs recommended).
-- `reranker.py` – loads SLM and scores candidate chunks at inference.
-- `generator.py` – deterministic persona templates (always on) and optional LLM polish.
-
-## Reproducibility & Explainability
-
-- Weak supervision labeling is printed and saved during reranker training.
-- All retrieved chunk metadata and reranker scores are returned in API responses for transparency.
-- The LLM (if used) only receives the retrieved chunks and the deterministic output to rephrase/polish (to minimize hallucinations). The core retrieval+SLM pipeline runs without any LLM.
-
-## Limitations
-
-- This is a prototype built for hackathon/demo purposes. For production:
-  - Persist sessions and vector store to durable storage.
-  - Add authentication and rate-limiting.
-  - Add more robust OCR and chunking/tokenization (use tokenizers aligned to your LLM).
-  - Expand training labeling strategies and validation sets.
-
-If you need help running the training step or adapting this to GPU, tell me your environment and I will provide tailored instructions.
+```bash
+python -m venv venv && source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt groq
+cp .env.example .env                                 # then set GROQ_API_KEY
+uvicorn app:app --reload --port 8000                 # terminal 1
+streamlit run ui.py                                  # terminal 2
 ```
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
+
+These checks run on every pull request through GitHub Actions. They need no API keys or model downloads.
+
+## Roadmap
+
+PersonaLens 2.0 is developed one milestone at a time, each on its own branch and pull request. See [`ARCHITECTURE.md` §11](ARCHITECTURE.md#11-milestones-7):
+1. audit and setup;
+2. backend hardening and a resource gate on free hosting;
+3. retrieval with citations, and the LLM provider evaluation;
+4. auth, persistence and quotas;
+5. the React foundation;
+6. the PDF library and Q&A workspace;
+7. tests and free-tier deployment.
+
+v2.0 runs entirely on free tiers, with no payment method required at any step.
