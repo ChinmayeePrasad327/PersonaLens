@@ -1,5 +1,32 @@
+# Secrets and local config
 .env
+.env.*
+!.env.example
+
+# Python
 venv/
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / frontend (from Milestone 5)
+node_modules/
+dist/
+.vite/
+
+# Local data and models
+models/
+*.faiss
+uploads/
+benchmarks/results/
+
+# Editors and OS
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db

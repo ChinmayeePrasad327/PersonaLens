@@ -1,7 +1,6 @@
 # pdf_processor.py
 import pdfplumber
 import pytesseract
-from PIL import Image
 import io
 
 # Ensure Tesseract is installed on your machine
