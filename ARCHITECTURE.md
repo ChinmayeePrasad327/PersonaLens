@@ -1,0 +1,178 @@
+# PersonaLens 2.0 — Architecture and Milestone Plan
+
+**Status:** proposal for review, 2026-11-12. Nothing in this document is implemented yet. See `AUDIT.md` for the current state.
+
+## 1. Principles
+
+- **Modular monolith.** There is one FastAPI service and one React app, with no queues, Redis, Kubernetes or microservices.
+- **Evolve, don't rewrite.** The existing modules move into `backend/app/` with `git mv` so their history is kept, then they are improved in place.
+- **Supabase is the source of truth.** Anything in memory, such as FAISS indexes or loaded models, is a cache that can be rebuilt after a restart.
+- **The RAG core does not depend on the web layer.** `backend/app/rag/` and `document_processing/` import nothing from FastAPI or Supabase and are unit-testable with plain data.
+- **Every citation is traceable** to a stored `chunk_id`, which maps to a `document_id` and page range. The LLM may only cite chunk IDs that it was given, and the backend checks this.
+
+## 2. System overview
+
+```
+ React (Vercel)                       FastAPI (Render)                        Supabase
+ ──────────────                       ────────────────                        ────────
+ Supabase Auth (anon key) ──login──▶                                          Auth
+        │ access token (JWT)
+        ▼
+ Axios ── Authorization: Bearer ──▶  api/  (routers, Pydantic schemas)
+                                       │  core/auth  verify JWT → user_id
+                                       ▼
+                                     services/  (documents, chat, study, compare)
+                                       │                     │
+                     document_processing/          rag/                     ──▶ Postgres (+ full-text, RLS)
+                     extract → OCR → pages         embed · FAISS cache        ──▶ Storage (private "documents" bucket)
+                                   → chunks        keyword (PG FTS) · fuse
+                                                   rerank · context · generate ──▶ Groq API
+```
+
+The browser talks to Supabase **only for authentication**. All data access goes through FastAPI. The Groq key and the Supabase service-role key exist only in the backend's environment.
+
+## 3. Repository layout (target)
+
+```
+PersonaLens/
+  backend/
+    app/
+      main.py                  # app factory, CORS, /health, routers
+      api/                     # auth, documents, chat, personas, study, compare, export
+      core/                    # config (pydantic-settings), auth, errors, logging
+      database/                # supabase client, queries per table, migrations/*.sql
+      document_processing/     # ← pdf_processor.py, chunker.py
+      rag/                     # ← embeddings.py, vector_store.py, relevance.py, generator.py
+                               #    + keyword.py, fusion.py, reranker.py, context.py, prompts.py
+      personas/                # ← personas.py (+ custom persona model)
+      services/                # orchestration: ingest, chat, summarise, quiz, compare, export
+    tests/                     # pytest: unit (rag, processing) + API (TestClient, fakes)
+    requirements.txt           # pinned; CPU-only torch
+    Dockerfile                 # includes tesseract-ocr for Render
+  frontend/
+    src/{components,pages,layouts,hooks,services,contexts,types,assets}
+    package.json
+  docs/                        # deployment guide, API reference, screenshots
+  AUDIT.md  ARCHITECTURE.md  README.md  .env.example  .gitignore
+```
+
+`ui.py` stays at the root and keeps working against the new API until the React chat reaches parity in Milestone 7. It is deleted at that point.
+
+## 4. Data model (Supabase Postgres)
+
+Every table has `user_id uuid references auth.users` and row-level security (RLS) with `user_id = auth.uid()`. The backend also filters by `user_id` explicitly on every query, so isolation does not depend on one mechanism.
+
+| Table | Key columns |
+|---|---|
+| `profiles` | `id` (= auth user), `display_name`, `default_persona_id`, `created_at` |
+| `documents` | `id`, `user_id`, `filename`, `storage_path`, `size_bytes`, `page_count`, `sha256`, `status` (`uploaded`/`processing`/`ready`/`failed`), `error`, `doc_type` (classification), `created_at` |
+| `document_pages` | `document_id`, `page_no`, `text`, `extraction` (`text`/`ocr`) |
+| `chunks` | `id`, `document_id`, `user_id`, `chunk_index`, `page_start`, `page_end`, `text`, `embedding` (`vector(384)` via pgvector, used only as storage), `tsv` (generated `tsvector`, GIN index) |
+| `collections`, `collection_documents` | user-defined groups of documents |
+| `personas` | built-in rows (`user_id` null, read-only) and custom rows: `role`, `name`, `knowledge_level`, `objective`, `style`, `output_format`, `difficulty`, `retrieval_hints` |
+| `conversations` | `id`, `user_id`, `title`, `persona_id`, `document_ids uuid[]`, timestamps |
+| `messages` | `conversation_id`, `role`, `content`, `citations jsonb` (`[{chunk_id, document_id, filename, page_start, page_end, quote}]`) |
+| `study_items` | summaries, quizzes and flashcard decks: `kind`, `document_ids`, `persona_id`, `params jsonb`, `content jsonb` |
+| `quiz_attempts` | `study_item_id`, `answers jsonb`, `score` |
+
+**Storage:** a private bucket `documents`, with objects stored at `{user_id}/{document_id}.pdf`. The PDF viewer loads short-lived signed URLs issued by the backend after an ownership check. The upload limit is 25 MB per file, under Supabase Free's 50 MB cap.
+
+## 5. Document pipeline
+
+1. **Upload.** `POST /documents` takes multipart input with multiple files. The backend checks the `%PDF-` signature, size and page limits, and deduplicates by `sha256` per user. It stores the file in Storage, inserts a `documents` row with status `processing`, and returns immediately.
+2. **Process.** Processing runs in a FastAPI `BackgroundTasks` job, with CPU work in a thread pool so the event loop stays free:
+   - **Extract.** pdfplumber reads each page. OCR is used when the extracted text is sparse **or** images cover most of the page, at 200 DPI with a page cap. Short lines are no longer dropped, and only repeated headers and footers are stripped.
+   - **Chunk.** Sentence-aware chunks of about 250 words with about 50 words of overlap. Chunks never cross a document and record `page_start` and `page_end`.
+   - **Embed and persist.** MiniLM in batches with normalised vectors. Pages and chunks with embeddings are written to Postgres, and status becomes `ready`.
+3. **Recover.** On startup, documents stuck in `processing` are re-queued. **Reprocess** re-runs step 2 from the stored PDF, and **delete** removes the Storage object and cascades to all rows.
+
+## 6. Retrieval and generation
+
+```
+query + persona + scope(document_ids) + chat history
+  │ 1. Query shaping: condense follow-up into standalone query (LLM, only when history exists);
+  │    append persona retrieval_hints (e.g. Methodology Analysis → "method, dataset, evaluation")
+  ├─▶ 2a. Semantic: FAISS IndexFlatIP per document, top 30
+  ├─▶ 2b. Keyword: Postgres websearch_to_tsquery + ts_rank_cd over chunks.tsv, top 30
+  │ 3. Reciprocal Rank Fusion (k=60) → top 30 unique chunks
+  │ 4. Cross-Encoder rerank (cross-encoder/ms-marco-MiniLM-L-6-v2) → top 8
+  │ 5. Context selection: token budget, per-document diversity for multi-doc questions,
+  │    merge adjacent chunks; each block tagged [C1] … [Cn] with filename + pages
+  │ 6. Generate (Groq): persona system prompt + tagged context + recent history;
+  │    model must cite [Cn]; "not found in your documents" when unsupported
+  └─▶ 7. Citation validation: drop any tag not in the provided set; map tags → chunk metadata
+```
+
+- **FAISS cache.** A per-document `IndexFlatIP` is built lazily from `chunks.embedding` on first use and kept in an LRU cache in memory. A restart or spin-down only costs a rebuild, about milliseconds per document at these sizes. Moving search to pgvector later is a contained change in `rag/vector_store.py`, but it is not planned.
+- **Persona influence.**
+  - **Retrieval:** hint terms, top-k and diversity. For example, Executive Summary favours breadth across sections, and GATE favours formulas and definitions.
+  - **Generation:** objective, knowledge level, style, output format and difficulty are rendered into the system prompt.
+
+  Tests assert that both sides change measurably between personas.
+- **LLM.** `GROQ_MODEL` is set through the environment, with a default of `openai/gpt-oss-120b`, which is Groq's listed production replacement. Structured outputs (quizzes, flashcards, comparisons) use JSON mode and are validated with Pydantic, with one retry on a validation error.
+- **Long-document tasks** (chapter-wise and detailed summaries, comparison) run map-reduce over page-grouped chunks instead of using the top 5 retrieved chunks.
+
+## 7. Open decision: model memory versus hosting
+
+torch, MiniLM and the Cross-Encoder take several hundred MB of RAM. Render's free tier spins down, has an ephemeral filesystem, and its RAM is not stated on its free-tier page. This must be measured, not guessed. **Proposal:** in Milestone 2, record the backend's peak resident memory (RSS) with both models loaded. Then pick one option:
+
+- **(a)** Sentence Transformers on CPU-only torch, on a paid Render instance sized to the measurement.
+- **(b)** The same models run through the ONNX backend to fit a smaller instance.
+
+The code keeps an `Embedder`/`Reranker` interface so either option is a configuration change. This choice is yours and will be raised with numbers before Milestone 10.
+
+## 8. API surface (v1, all under `/api`, all require a Bearer token except health)
+
+| Area | Endpoints |
+|---|---|
+| Health | `GET /health` (liveness, plus DB and Groq configuration checks) |
+| Me | `GET/PATCH /me` |
+| Documents | `POST /documents`, `GET /documents`, `GET /documents/{id}`, `GET /documents/{id}/file-url`, `POST /documents/{id}/reprocess`, `DELETE /documents/{id}` |
+| Collections | CRUD `/collections` |
+| Personas | `GET /personas`, CRUD `/personas/custom` |
+| Chat | `POST /conversations`, `GET /conversations`, `GET /conversations/{id}`, `DELETE /conversations/{id}`, `POST /conversations/{id}/messages` (streams the answer, then sends citations) |
+| Study | `POST /summaries` (type: quick, detailed, executive, chapter, takeaways, definitions, formulas, conclusions), `POST /quizzes`, `POST /quizzes/{id}/attempts`, `POST /flashcards` |
+| Intelligence | `POST /compare` (similarities, contradictions with citations from both sides), `POST /analyze` (concepts, classification, research-paper analysis, gaps) |
+| Export | `GET /export/{study_item_id}?format=pdf|docx|csv` |
+
+## 9. Frontend
+
+- **Stack:** React, TypeScript, Vite, Tailwind, React Router, Axios, `@supabase/supabase-js` (auth only), Lucide, Swiper, GSAP, Motion. PDF rendering adds **react-pdf** (pdf.js), the one dependency beyond your list. It is needed for the viewer and page-jump-to-citation.
+- **Animation ownership:** GSAP handles the landing hero and scroll reveals only, and Motion handles everything in the app. No element is animated by both.
+- **Design tokens:** a warm neutral base, navy and charcoal ink, and one indigo-violet accent. These are defined once as CSS variables and mapped into Tailwind, with light and dark themes and WCAG AA contrast checked.
+- **Workspace:** a three-pane layout (library and history, PDF viewer, chat with persona and citations) that collapses into tabs below `lg`. Clicking a citation jumps the viewer to the cited page and highlights the passage preview.
+- **Rule:** a screen ships only when its backend endpoint exists. No button is added before its endpoint.
+- **Tests:** Vitest and React Testing Library for components and hooks, plus one Playwright smoke test (sign up → upload → ask → citation) in Milestone 10.
+
+## 10. Configuration and security
+
+- **`.env` variables.** Backend: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET` (or JWKS), `GROQ_API_KEY`, `GROQ_MODEL`, `ALLOWED_ORIGINS`, `MAX_UPLOAD_MB`. Frontend: `VITE_API_URL`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (public by design).
+- **CORS:** an explicit origin list, with no wildcard alongside credentials.
+- **Errors:** errors are logged server-side and clients get typed messages.
+- **Rendering:** answers are rendered as sanitised Markdown and never as raw HTML.
+- **Rate limiting:** a simple per-user limit in process on LLM endpoints. No Redis.
+
+## 11. Milestone plan
+
+Each milestone uses its own branch from the latest `main`, opens a PR to `main` on `ChinmayeePrasad327/PersonaLens`, and waits for your review and merge before the next one starts.
+
+| # | Branch | Delivers | Verified by |
+|---|---|---|---|
+| 1 | `docs/m1-audit-architecture` | This audit and architecture (this PR). **After your approval, same PR:** `.env.example`, a fuller `.gitignore`, a corrected README "current state" section, and a pytest scaffold with CI (GitHub Actions: lint and test). | CI green |
+| 2 | `feat/m2-backend-stabilization` | `git mv` into `backend/app/`. Fixes C1–C3, H1, M1–M4, S3, S4, S6, P1, P2. Per-page extraction with better OCR and cleaning. Page-aware chunks with metadata. Config through settings. `/health`. Pinned requirements, CPU torch, Dockerfile with Tesseract. Memory measurement for §7. `ui.py` updated to keep working. | pytest for extraction (text and scanned fixtures), chunk page mapping, API with a faked LLM |
+| 3 | `feat/m3-rag-citations` | Hybrid retrieval (FAISS and keyword with RRF), Cross-Encoder rerank, context selection, citation-tagged generation with validation, persona retrieval hints, expanded built-in personas. A small retrieval eval set with recall@k reported in the PR. | Unit tests per stage, a citation-integrity test, before and after eval numbers |
+| 4 | `feat/m4-supabase-persistence` | SQL migrations with RLS, Storage bucket, JWT auth dependency, document CRUD, reprocess, delete, processing status, FAISS rebuild from the database after restart, conversation persistence. | Two-user isolation tests, restart-then-query test |
+| 5 | `feat/m5-frontend-foundation` | Vite, React and TypeScript scaffold, design system, landing page, auth screens wired to Supabase, protected routes. | Vitest, Lighthouse accessibility check, screenshots in the PR |
+| 6 | `feat/m6-dashboard-workspace` | Dashboard, library with drag-and-drop multi-upload and progress, three-pane workspace with the PDF viewer, collections, mobile tabs. | Component tests, manual run against the M4 backend |
+| 7 | `feat/m7-chat-personas` | Streaming multi-document chat, follow-ups, history, delete and new conversation, citation-to-page jump, persona settings and custom persona builder. **Retire `ui.py`.** | API and UI tests, persona-difference test |
+| 8 | `feat/m8-study-tools` | Summaries (all 8 types), MCQ, short and long answer, practice tests with scoring and explanations, flashcards with flip, exam mode. | Schema-validated LLM output tests, scoring tests |
+| 9 | `feat/m9-compare-research` | Multi-PDF comparison (similarities and contradictions with two-sided citations), concept, definition and formula extraction, classification, research-paper analysis and gaps. | Tests on fixture paper pairs |
+| 10 | `feat/m10-export-deploy` | PDF, DOCX and CSV export. Performance pass. Deployment guide. Render, Vercel and Supabase configuration. Live end-to-end test of every item in your deployment checklist, on the deployed URLs, before reporting success. | Playwright smoke test on production, plus manual checklist evidence in the PR |
+
+Milestones 2–4 are backend-only and keep the Streamlit UI usable, so `main` stays demoable at every merge.
+
+## 12. Things you will need to do (no credentials in chat)
+
+- **Before Milestone 4:** create a Supabase project, enable the `vector` extension, and add its keys to a local `.env` and later to Render. I will provide exact click-paths and the SQL.
+- **Before Milestone 10:** connect the repository to Vercel and Render in their dashboards, and set environment variables there.
+- **Any time before Milestone 2 is tested live:** a Groq API key in your local `.env`.
