@@ -60,7 +60,7 @@ PersonaLens/
 
 ## 4. Data model (Supabase Postgres)
 
-Every table has `user_id uuid references auth.users` and row-level security (RLS) with `user_id = auth.uid()`. The backend also filters by `user_id` explicitly on every query, so isolation does not depend on one mechanism.
+Every table has `user_id uuid references auth.users` and row-level security (RLS) with `user_id = auth.uid()`. **User-scoped queries run as the caller:** the backend forwards the user's own JWT to Supabase, so RLS actually applies. The service-role key bypasses RLS, so it is used only where no user token exists: background ingestion of a document whose ownership was already checked, Storage housekeeping, and migrations. Those code paths always filter by `user_id` explicitly. A two-user isolation test covers both paths.
 
 | Table | Key columns |
 |---|---|
