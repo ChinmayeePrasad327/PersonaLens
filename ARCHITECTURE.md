@@ -1,273 +1,264 @@
 # PersonaLens 2.0 — Architecture and Milestone Plan
 
-**Status:** proposal for review, 2026-11-12. Nothing in this document is implemented yet. See `AUDIT.md` for the current state.
+**Status:** proposal for review, revision 3, 2026-11-12. Nothing in this document is implemented yet. See `AUDIT.md` for the current state of the code.
+
+**What v2.0 is:** a small free-tier demo, not a public launch. One person (or a handful of invited users) can upload a PDF, have it processed, and ask grounded questions about it with validated page citations. Everything runs on free tiers with no payment method, card, billing account or paid plan required at any step. Cold starts, paused services, quota limits and temporary unavailability are expected and are shown honestly in the UI. The README also documents a local demo path (uvicorn plus the Vite dev server, pointed at a free Supabase project) for interviews when the hosted demo is asleep or out of quota.
 
 ## 1. Principles
 
-- **Modular monolith.** There is one FastAPI service and one React app, with no queues, Redis, Kubernetes or microservices.
-- **Evolve, don't rewrite.** The existing modules move into `backend/app/` with `git mv` so their history is kept, then they are improved in place.
-- **Supabase is the source of truth.** Anything in memory, such as FAISS indexes or loaded models, is a cache that can be rebuilt after a restart.
-- **The RAG core does not depend on the web layer.** `backend/app/rag/` and `document_processing/` import nothing from FastAPI or Supabase and are unit-testable with plain data.
-- **Every citation is traceable** to a stored `chunk_id`, which maps to a `document_id` and page range. The LLM may only cite chunk IDs that it was given, and the backend checks this.
+- **One journey, done well:** upload PDF → process → retrieve relevant passages → ask → grounded answer with page citations. Anything else is a [future improvement](#12-future-improvements-not-in-v20).
+- **Measure before claiming.** No capacity, latency or memory figure is stated as fact until it has been measured on the real free configuration. Figures in this document marked *estimate* are planning inputs only.
+- **Simplify instead of paying.** If a benchmark fails on the free tier, the architecture gets simpler. No paid upgrade is ever the fix.
+- **Modular monolith.** One FastAPI service and one React app, with no queues, Redis or microservices. Existing modules move into `backend/app/` with `git mv` to keep their history.
+- **Supabase is the source of truth.** Anything in process memory, such as loaded models or cached vectors, is disposable and is rebuilt on demand.
+- **No resource is "free".** LLM tokens are the scarcest resource, but OCR, embeddings, reranking, search, database rows, storage and bandwidth all cost CPU, RAM, disk or quota. Each one is bounded and measured.
 
-## 2. v2.0 scope under the free quota
+## 2. v2.0 scope
 
-PersonaLens v2.0 runs at ₹0, so its features are chosen by their AI token cost. Everything that runs locally costs no tokens and stays in scope: upload, OCR, chunking, embeddings, hybrid search, reranking, the PDF viewer, scoring and exports. LLM calls are kept to the core job, which is **upload PDFs and ask grounded questions with page citations**. Token-heavy extras move to [Future improvements](#15-future-improvements-out-of-scope-for-v20).
+| In v2.0 | Notes |
+|---|---|
+| Auth and user isolation | Supabase Auth: register, login, logout, protected routes, profile. Every file, chunk, conversation, message and citation is scoped to the authenticated user. |
+| PDF management | Upload one PDF at a time with validation and progress, list, view, delete, processing status, and **Retry** on failure. |
+| Extraction | pdfplumber text per page. OCR fallback is bounded by page count, DPI and time (§5). |
+| Chunking | Page-aware, sentence-aware, overlapping chunks carrying `document_id`, `filename`, `page_start`, `page_end`, `chunk_id` and `text`. |
+| Retrieval | Low-resource embeddings plus Postgres full-text keyword search, fused with Reciprocal Rank Fusion (RRF). Cross-Encoder reranking is **off by default** and turned on only if the benchmark shows it fits (§6). |
+| Grounded Q&A | One document at a time. Answers cite only passages actually supplied, and the backend validates every citation. "Not found in this document" when unsupported. |
+| Conversation history | Saved per document. New and delete conversation. Follow-ups are resolved deterministically, with no extra LLM call (§7). |
+| Personas | Four fixed compact prompt presets: **Beginner, Exam Preparation, Researcher, Professional**. Their prompt tokens are counted in the budget. |
+| Quota visibility | Usage meter, clear quota and "AI unavailable" states, admin kill switch. Viewing, metadata and local search keep working when AI is off. |
+| Frontend | React + TypeScript + Vite + Tailwind. Landing page, auth, library, workspace (PDF viewer + Q&A + citations), settings and usage. |
+| Answer export | Client-side "Copy" and "Download as Markdown" for a single answer with its citations. No server work. |
 
-### Token budget (Groq free tier, per model, to be confirmed on your console)
-
-| Model | Daily budget | Used for | Approximate cost per use | Capacity per day |
-|---|---|---|---|---|
-| `openai/gpt-oss-120b` | 200K tokens | Chat answers only | About 3.5K (6 chunks of context, short history, about 600 tokens out) | **About 50 answers** |
-| `openai/gpt-oss-20b` | 200K tokens (separate quota) | Follow-up condensing (about 0.5K), document brief (about 6K, once per document), quiz or flashcard set (about 4K, once per request) | Varies | About 15 documents briefed **plus** about 20 quiz or flashcard sets |
-
-The binding per-minute limit is about 8K tokens, which is roughly 2 chat answers per minute across all users. The app queues briefly and then shows "AI is busy, try again in N s" instead of failing. This capacity suits a portfolio demo and a small group of users. It is not a public service, and the README will say so.
-
-**Guards that keep every core feature working within quota:**
-- Per-user daily limits (default 25 questions and 5 study generations) and a visible usage meter.
-- Generated briefs, quizzes and flashcards are cached in the database and reused. Opening them again costs nothing.
-- Context is capped by tokens, and chat history is trimmed to the last 4 turns.
-- When a quota runs out, the app gives a clear message with the reset time. The rest of the app (library, viewer, search, saved study items, exports) keeps working.
-- Upload caps to stay inside Supabase Free's 1 GB storage: 20 MB and 300 pages per PDF, and 10 documents per user.
-
-### In scope for v2.0
-
-| Area | Included | AI tokens? |
-|---|---|---|
-| Auth | Register, login, logout, protected pages, profile, per-user data isolation | No |
-| Documents | Drag-and-drop multi-upload with validation and progress, library, metadata, status, PDF viewer, delete, reprocess, collections | No |
-| RAG | Extraction, OCR fallback, page-aware overlapping chunks, embeddings, FAISS and keyword hybrid search, Cross-Encoder rerank, context selection, validated page citations | Only for the answer |
-| Chat | Multi-document grounded chat, follow-ups, saved history, new and delete conversation, citation-to-page jump, passage previews | Yes (120b) |
-| Personas | All 14 built-in sub-personas and custom personas (knowledge level, objective, style, output format, difficulty). They shape retrieval hints and the prompt at no extra token cost. | No extra |
-| Document brief | One cached call per document returns a quick summary, key takeaways and important definitions | Yes, once (20b) |
-| Learning | MCQ quiz (5–10 questions with explanations, difficulty choice), interactive scoring done locally, flashcards with flip | Yes, once per set (20b) |
-| Export | Chat answers with citations and briefs to PDF and DOCX, flashcards and quizzes to CSV | No |
+Everything else (multi-document chat, collections, custom personas, briefs, summaries, quizzes, flashcards, comparison, research assistant, DOCX/CSV/PDF export, and a fallback provider) is listed in §12 with its added cost.
 
 ## 3. System overview
 
 ```
- React (Vercel)                       FastAPI (Render)                        Supabase
- ──────────────                       ────────────────                        ────────
- Supabase Auth (anon key) ──login──▶                                          Auth
-        │ access token (JWT)
-        ▼
- Axios ── Authorization: Bearer ──▶  api/  (routers, Pydantic schemas)
-                                       │  core/auth  verify JWT → user_id
-                                       ▼
-                                     services/  (documents, chat, study)
-                                       │                     │
-                     document_processing/          rag/                     ──▶ Postgres (+ full-text, RLS)
-                     extract → OCR → pages         embed · FAISS cache        ──▶ Storage (private "documents" bucket)
-                                   → chunks        keyword (PG FTS) · fuse
-                                                   rerank · context · generate ──▶ Groq API
+ React (Vercel Hobby)               FastAPI (Render Free)                       Supabase Free
+ ────────────────────               ─────────────────────                       ─────────────
+ supabase-js: auth only ─login──▶                                               Auth
+       │ user JWT
+       ▼
+ Axios ─ Bearer JWT ───────────▶  api/ ─ core/auth: verify JWT → user_id
+                                    │      core/quota: global + per-user token ledger, kill switch
+                                    ▼
+                                  services/ (documents, ingest, qa)
+                                    │                    │
+                document_processing/                 rag/
+                extract → bounded OCR → chunks       embed (lazy) · vector + keyword search · RRF
+                                                     [rerank: optional] · context · prompt
+                                                     llm/ provider adapter ─────────────────────▶ LLM API (chosen in M3)
+                                    │
+                                    └── database/ (queries run as the user, RLS applies) ────────▶ Postgres + Storage
 ```
 
-The browser talks to Supabase **only for authentication**. All data access goes through FastAPI. The Groq key and the Supabase service-role key exist only in the backend's environment.
+The browser uses Supabase **only for authentication**. All data access goes through FastAPI. LLM keys and the Supabase service-role key exist only in the backend's environment.
 
-## 4. Repository layout (target)
+## 4. Data model, isolation and storage
 
-```
-PersonaLens/
-  backend/
-    app/
-      main.py                  # app factory, CORS, /health, routers
-      api/                     # auth, documents, chat, personas, study, export
-      core/                    # config (pydantic-settings), auth, errors, logging
-      database/                # supabase client, queries per table, migrations/*.sql
-      document_processing/     # ← pdf_processor.py, chunker.py
-      rag/                     # ← embeddings.py, vector_store.py, relevance.py, generator.py
-                               #    + keyword.py, fusion.py, reranker.py, context.py, prompts.py
-      personas/                # ← personas.py (+ custom persona model)
-      services/                # orchestration: ingest, chat, brief, quiz, flashcards, export
-    tests/                     # pytest: unit (rag, processing) + API (TestClient, fakes)
-    requirements.txt           # pinned; CPU-only torch
-    Dockerfile                 # includes tesseract-ocr for Render
-  frontend/
-    src/{components,pages,layouts,hooks,services,contexts,types,assets}
-    package.json
-  docs/                        # deployment guide, API reference, screenshots
-  AUDIT.md  ARCHITECTURE.md  README.md  .env.example  .gitignore
-```
-
-`ui.py` stays at the root and keeps working against the new API until the React chat reaches parity in Milestone 7. It is deleted at that point.
-
-## 5. Data model (Supabase Postgres)
-
-Every table has `user_id uuid references auth.users` and row-level security (RLS) with `user_id = auth.uid()`. **User-scoped queries run as the caller:** the backend forwards the user's own JWT to Supabase, so RLS actually applies. The service-role key bypasses RLS, so it is used only where no user token exists: background ingestion of a document whose ownership was already checked, Storage housekeeping, and migrations. Those code paths always filter by `user_id` explicitly. A two-user isolation test covers both paths.
+### Tables (Supabase Postgres, RLS enabled on every table)
 
 | Table | Key columns |
 |---|---|
-| `profiles` | `id` (= auth user), `display_name`, `default_persona_id`, `created_at` |
-| `documents` | `id`, `user_id`, `filename`, `storage_path`, `size_bytes`, `page_count`, `sha256`, `status` (`uploaded`/`processing`/`ready`/`failed`), `error`, `created_at` |
-| `document_pages` | `document_id`, `page_no`, `text`, `extraction` (`text`/`ocr`) |
-| `chunks` | `id`, `document_id`, `user_id`, `chunk_index`, `page_start`, `page_end`, `text`, `embedding` (`vector(384)` via pgvector, used only as storage), `tsv` (generated `tsvector`, GIN index) |
-| `collections`, `collection_documents` | user-defined groups of documents |
-| `personas` | built-in rows (`user_id` null, read-only) and custom rows: `role`, `name`, `knowledge_level`, `objective`, `style`, `output_format`, `difficulty`, `retrieval_hints` |
-| `conversations` | `id`, `user_id`, `title`, `persona_id`, `document_ids uuid[]`, timestamps |
-| `messages` | `conversation_id`, `role`, `content`, `citations jsonb` (`[{chunk_id, document_id, filename, page_start, page_end, quote}]`) |
-| `study_items` | document briefs, quizzes and flashcard decks: `kind`, `document_ids`, `persona_id`, `params jsonb`, `content jsonb` |
-| `quiz_attempts` | `study_item_id`, `answers jsonb`, `score` |
+| `profiles` | `id` (= `auth.users.id`), `display_name`, `default_persona` |
+| `documents` | `id`, `user_id`, `filename`, `storage_path`, `size_bytes`, `page_count`, `sha256`, `status` (`queued`/`processing`/`ready`/`failed`), `error`, `attempts`, `lease_until`, `ocr_pages`, `created_at` |
+| `chunks` | `id`, `document_id`, `user_id`, `chunk_index`, `page_start`, `page_end`, `text`, `embedding` (pgvector `vector(384)`), `tsv` (generated `tsvector`, GIN index) |
+| `conversations` | `id`, `user_id`, `document_id`, `persona`, `title`, timestamps |
+| `messages` | `id`, `conversation_id`, `user_id`, `role`, `content`, `citations jsonb` (`[{chunk_id, page_start, page_end, quote}]`), `provider`, `model`, `tokens_in`, `tokens_out` |
+| `llm_usage` | `id`, `user_id`, `day`, `reserved_tokens`, `actual_in`, `actual_out`, `status` (`ok`/`rate_limited`/`error`), `created_at` |
+| `app_settings` | single row: `ai_enabled`, `global_daily_token_cap`, `per_user_daily_questions`, `storage_cap_bytes`, `db_rows_cap` |
 
-**Storage:** a private bucket `documents`, with objects stored at `{user_id}/{document_id}.pdf`. The PDF viewer loads short-lived signed URLs issued by the backend after an ownership check. The upload limit is 20 MB and 300 pages per file, and 10 documents per user (§2), under Supabase Free's 50 MB file cap and 1 GB total.
+Full page text is **not** stored. Chunks are enough for retrieval and citations, and the original PDF in Storage is the source for viewing and reprocessing.
 
-## 6. Document pipeline
+### Isolation
 
-1. **Upload.** `POST /documents` takes multipart input with multiple files. The backend checks the `%PDF-` signature, size and page limits, and deduplicates by `sha256` per user. It stores the file in Storage, inserts a `documents` row with status `processing`, and returns immediately.
-2. **Process.** Processing runs in a FastAPI `BackgroundTasks` job, with CPU work in a thread pool so the event loop stays free:
-   - **Extract.** pdfplumber reads each page. OCR is used when the extracted text is sparse **or** images cover most of the page, at 200 DPI with a page cap. Short lines are no longer dropped, and only repeated headers and footers are stripped.
-   - **Chunk.** Sentence-aware chunks of about 250 words with about 50 words of overlap. Chunks never cross a document and record `page_start` and `page_end`.
-   - **Embed and persist.** MiniLM in batches with normalised vectors. Pages and chunks with embeddings are written to Postgres, and status becomes `ready`.
-3. **Recover.** On startup, documents stuck in `processing` are re-queued. **Reprocess** re-runs step 2 from the stored PDF, and **delete** removes the Storage object and cascades to all rows.
+- **Normal user requests run as the user.** The backend forwards the caller's JWT to Supabase, so RLS (`user_id = auth.uid()`) applies to every read and write. The service-role key is **not** used for user-scoped queries.
+- **Service role is limited to:** the ingest worker writing chunks for a document whose ownership was verified at upload (it also filters by `user_id`), and the storage and row guard totals. Each use is a named function in `database/admin.py`, so it is easy to audit.
+- **Citations are re-checked.** Before a citation is returned, its `chunk_id` must belong to the conversation's document, which in turn belongs to the user.
+- **Storage paths** are `{user_id}/{document_id}.pdf` in a private bucket, with Storage RLS on the path prefix. Signed URLs are short-lived and issued only after an ownership check.
+- **Gate:** no public deployment (Milestone 7) until the cross-user isolation suite passes. That suite covers files, chunks, conversations, messages, citations and signed URLs, with two real test users.
 
-## 7. Retrieval and generation
+### Storage and database limits
 
-```
-query + persona + scope(document_ids) + chat history
-  │ 1. Query shaping: condense follow-up into standalone query (LLM, only when history exists);
-  │    append persona retrieval_hints (e.g. Methodology Analysis → "method, dataset, evaluation")
-  ├─▶ 2a. Semantic: FAISS IndexFlatIP per document, top 30
-  ├─▶ 2b. Keyword: Postgres websearch_to_tsquery + ts_rank_cd over chunks.tsv, top 30
-  │ 3. Reciprocal Rank Fusion (k=60) → top 30 unique chunks
-  │ 4. Cross-Encoder rerank (cross-encoder/ms-marco-MiniLM-L-6-v2) → top 8
-  │ 5. Context selection: token budget, per-document diversity for multi-doc questions,
-  │    merge adjacent chunks; each block tagged [C1] … [Cn] with filename + pages
-  │ 6. Generate (Groq): persona system prompt + tagged context + recent history;
-  │    model must cite [Cn]; "not found in your documents" when unsupported
-  └─▶ 7. Citation validation: drop any tag not in the provided set; map tags → chunk metadata
-```
+Supabase Free gives **1 GB of Storage and 500 MB of database per project, shared by all users**. These are not per-user allowances. *Estimates, to be replaced by Milestone 2 measurements:*
 
-- **FAISS cache.** A per-document `IndexFlatIP` is built lazily from `chunks.embedding` on first use and kept in an LRU cache in memory. A restart or spin-down only costs a rebuild, about milliseconds per document at these sizes. Moving search to pgvector later is a contained change in `rag/vector_store.py`, but it is not planned.
-- **Persona influence.**
-  - **Retrieval:** hint terms, top-k and diversity. For example, the Executive Summary persona favours breadth across sections, and GATE favours formulas and definitions.
-  - **Generation:** objective, knowledge level, style, output format and difficulty are rendered into the system prompt.
+- **Per chunk:** about 1.2 KB of text, about 1.6 KB of vector, and about 1 KB for the tsvector and indexes, so roughly 4 KB per chunk.
+- **Per document:** a 100-page PDF yields about 300 chunks, which is about 1.2 MB of database.
 
-  Tests assert that both sides change measurably between personas.
-- **LLM.** Generation goes through a provider adapter (§8). Structured outputs (briefs, quizzes, flashcards) use the provider's JSON-schema mode where it exists and are always validated with Pydantic, with one repair retry. A second failure becomes a typed error and is never shown as content.
-- **Document brief** uses extractive pre-selection rather than the whole document: the top-ranked chunk per section or heading, capped at about 4K tokens of input, then one structured call.
-
-## 8. LLM provider choice (₹0 budget)
-
-**Constraint:** no paid API usage, no payment method on file, and no fallback that could start billing. All facts below come from each provider's official pages, read on 2026-11-12. They will be re-checked before Milestone 2 and Milestone 9.
-
-| Provider and model | Free without a payment method? | Free-tier limits | Context | Structured output | Data handling on free tier | Verdict |
-|---|---|---|---|---|---|---|
-| **Groq**, `openai/gpt-oss-120b` (plus `gpt-oss-20b` for light tasks) | Yes. A card is only needed to upgrade to Developer. | 30 RPM, 1K RPD, **8K TPM, 200K TPD** per model. The docs table is labelled ambiguously, so the real numbers must be confirmed on the console Limits page. | 131K | JSON schema `strict: true` (constrained decoding), but not with streaming | "By default, Groq does not retain customer data for inference requests." Abuse logs are kept up to 30 days and can be opted out of, and Zero Data Retention is self-serve. | **Primary** |
-| **Google Gemini** Developer API, `gemini-3.5-flash` / `gemini-3.1-flash-lite` | Yes, no billing account. India is an available region. | Per-model numbers are shown only inside AI Studio and must be verified there. | Large (exact value not stated on the pages read) | JSON schema | **Free-tier content is "used to improve our products", "human reviewers may read… your API input and output"**, and the terms say "do not submit sensitive, confidential, or personal information". | **Not in v2.0.** A possible future opt-in fallback (§15) |
-| **Mistral**, `mistral-small` 4 (256K) | A free API tier exists with "restrictive rate limits". | Not published; shown only in the console. | 256K | Yes | Training on free-tier data is not stated (the Free column is blank). | Candidate for evaluation only, pending console verification |
-| **Cerebras**, `gpt-oss-120b` | **No.** Free credit requires adding a payment method and expires in 30 days. "Is there a permanently free tier? No." | 5 RPM | 65K on trial | Strict JSON schema | No retention of inputs or outputs | **Excluded** (needs a payment method) |
-| **Cohere** trial, Command A | Yes | **1,000 calls per month**, 20 RPM. Trial keys are "evaluation keys". | 256K | Native citations | Not found | **Excluded** (quota far too small, evaluation-only) |
-| **OpenRouter** `:free` models | Yes | **50 requests per day** without buying credits | Varies | Varies | Some upstream providers train on prompts; this is controlled by an account setting. | **Excluded** (quota) |
-
-**Recommendation: Groq `openai/gpt-oss-120b` as the default provider.**
-- It is the only candidate that is free with no payment method, retains no inference data by default, and offers schema-constrained JSON. Those three properties matter most for a product that ingests users' private PDFs and depends on valid quizzes and flashcards.
-- `gpt-oss-20b` has its own quota, so it handles follow-up condensing, document briefs, quizzes and flashcards. That saves the 120B quota for answers.
-- The binding limit is tokens: **8K tokens per minute and 200K per day**. A grounded answer uses about 3–5K tokens, which is roughly 40–60 answers a day.
-
-**How the app lives within that quota:**
-- Context packing is tight: 6–8 reranked chunks, not whole documents.
-- Generated summaries, quizzes and flashcards are stored and reused, so they are never regenerated for the same inputs.
-- Per-user daily limits, caching and quota messages, as set out in §2.
-
-**Choosing on quality, not on paper.** Milestone 3 adds a small evaluation set: about 30 questions over 3 fixture PDFs, with gold pages. It measures faithfulness, citation accuracy, "not found" correctness and JSON validity on Groq, using about 120K tokens in one run, and the results go in the PR. A cross-provider comparison is a future improvement (§15).
-
-### Provider adapter
-
-```
-rag/llm/
-  base.py        # LLMProvider protocol: generate(), generate_stream(), generate_json(schema)
-                 # typed errors: QuotaExceeded, RateLimited(retry_after), ProviderUnavailable,
-                 #               ModelUnavailable, InvalidStructuredOutput, ProviderAuthError
-  groq.py        # OpenAI-compatible chat API
-  registry.py    # builds providers from settings; no provider imported unless configured
-```
-
-- **Configuration:** `LLM_PRIMARY=groq:openai/gpt-oss-120b` and `LLM_LIGHT=groq:openai/gpt-oss-20b`. Keys are read only by the backend. v2.0 ships only the Groq adapter. The interface lets another provider be added later without touching the RAG code.
-- **Retries:** 429 responses honour `retry-after` with bounded backoff, at most 2 retries within the request's time budget. Then the user gets a typed error with the reset time.
-- **Fallback rules (for a future second provider; there is no fallback in v2.0):**
-  - A fallback exists only if the admin configures it **and** the signed-in user has opted in, per user and revocable in Settings.
-  - The opt-in screen names the provider and quotes its data policy (for Gemini free tier: content may be used to improve Google products and read by human reviewers).
-  - Without both, a primary failure is shown as an error, never silently rerouted. Every answer records and displays which provider and model produced it.
-  - Only providers verified as free without a payment method may be registered. The registry refuses any key flagged as billing-enabled in config, and the deployment guide explains how to keep Gemini and Groq keys on unbilled projects.
-- **Never an error as an answer:** a provider error maps to an HTTP 4xx/5xx with a typed body. Answers and study items are only stored on success.
-
-## 9. Open decision: model memory versus free hosting
-
-Under the ₹0 rule, the backend must fit Render's free web service. That service spins down after 15 minutes and has an ephemeral filesystem; its RAM is not stated on its free-tier page and must be confirmed. A paid instance is no longer an option. Milestone 2 measures the backend's peak memory with the embedding model and Cross-Encoder loaded, then applies whichever of these is needed to fit:
-
-- Run both models through Sentence Transformers' ONNX backend on CPU-only builds.
-- Load the Cross-Encoder lazily and skip it when the candidate set is small.
-- As a last resort, make reranking a documented optional feature.
-
-The `Embedder` and `Reranker` interfaces keep this a configuration change. Embeddings stay local, so document text is never sent to a third-party embedding API.
-
-## 10. API surface (v1, all under `/api`, all require a Bearer token except health)
-
-| Area | Endpoints |
-|---|---|
-| Health | `GET /health` (liveness, plus DB and Groq configuration checks) |
-| Me | `GET/PATCH /me` |
-| Documents | `POST /documents`, `GET /documents`, `GET /documents/{id}`, `GET /documents/{id}/file-url`, `POST /documents/{id}/reprocess`, `DELETE /documents/{id}` |
-| Collections | CRUD `/collections` |
-| Personas | `GET /personas`, CRUD `/personas/custom` |
-| Chat | `POST /conversations`, `GET /conversations`, `GET /conversations/{id}`, `DELETE /conversations/{id}`, `POST /conversations/{id}/messages` (streams the answer, then sends citations) |
-| Study | `POST /documents/{id}/brief` (cached), `POST /quizzes`, `POST /quizzes/{id}/attempts` (scored locally, no tokens), `POST /flashcards`, `GET /study-items` |
-| Usage | `GET /usage` (today's questions and generations against the limits) |
-| Export | `GET /export/conversation/{id}?format=pdf\|docx`, `GET /export/{study_item_id}?format=pdf\|docx\|csv` |
-
-## 11. Frontend
-
-- **Stack:** React, TypeScript, Vite, Tailwind, React Router, Axios, `@supabase/supabase-js` (auth only), Lucide, Swiper, GSAP, Motion. PDF rendering adds **react-pdf** (pdf.js), the one dependency beyond your list. It is needed for the viewer and page-jump-to-citation.
-- **Animation ownership:** GSAP handles the landing hero and scroll reveals only, and Motion handles everything in the app. No element is animated by both.
-- **Design tokens:** a warm neutral base, navy and charcoal ink, and one indigo-violet accent. These are defined once as CSS variables and mapped into Tailwind, with light and dark themes and WCAG AA contrast checked.
-- **Screens:** landing, login and registration, dashboard, document library and upload, workspace (viewer and chat), persona configuration, document brief, quiz, flashcards, conversation history, settings and usage. Comparison and research-assistant screens are future improvements.
-- **Workspace:** a three-pane layout (library and history, PDF viewer, chat with persona and citations) that collapses into tabs below `lg`. Clicking a citation jumps the viewer to the cited page and highlights the passage preview.
-- **Rule:** a screen ships only when its backend endpoint exists. No button is added before its endpoint.
-- **Tests:** Vitest and React Testing Library for components and hooks, plus one Playwright smoke test (sign up → upload → ask → citation) in Milestone 9.
-
-## 12. Configuration and security
-
-- **`.env` variables.** Backend: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET` (or JWKS), `LLM_PRIMARY`, `LLM_LIGHT`, `GROQ_API_KEY`, `ALLOWED_ORIGINS`, `MAX_UPLOAD_MB`, `MAX_DOCS_PER_USER`, `DAILY_QUESTIONS_PER_USER`, `DAILY_GENERATIONS_PER_USER`. Frontend: `VITE_API_URL`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (public by design).
-- **CORS:** an explicit origin list, with no wildcard alongside credentials.
-- **Errors:** errors are logged server-side and clients get typed messages.
-- **Rendering:** answers are rendered as sanitised Markdown and never as raw HTML.
-- **Rate limiting:** per-user daily counters stored in Postgres, plus a short in-process queue for the per-minute token limit. No Redis.
-
-## 13. Milestone plan
-
-Each milestone uses its own branch from the latest `main`, opens a PR to `main` on `ChinmayeePrasad327/PersonaLens`, and waits for your review and merge before the next one starts.
-
-| # | Branch | Delivers | Verified by |
-|---|---|---|---|
-| 1 | `docs/m1-audit-architecture` | This audit and architecture (this PR). **After your approval, same PR:** `.env.example`, a fuller `.gitignore`, a corrected README "current state" section, and a pytest scaffold with CI (GitHub Actions: lint and test). | CI green |
-| 2 | `feat/m2-backend-stabilization` | `git mv` into `backend/app/`. Fixes C1–C3, H1, M1–M4, S3, S4, S6, P1, P2. Per-page extraction with better OCR and cleaning. Page-aware chunks with metadata. Config through settings. `/health`. **Groq provider adapter with typed errors and 429 handling (§8).** Pinned requirements, CPU torch, Dockerfile with Tesseract. Memory measurement and fit for the free tier (§9). `ui.py` updated to keep working. | pytest for extraction (text and scanned fixtures), chunk page mapping, API with a faked LLM, quota-error tests |
-| 3 | `feat/m3-rag-citations` | Hybrid retrieval (FAISS and keyword with RRF), Cross-Encoder rerank, token-capped context selection, citation-tagged generation with validation, persona retrieval hints, all 14 built-in personas. Retrieval eval (recall@k) and the Groq grounded-answer eval (§8). | Unit tests per stage, a citation-integrity test, eval numbers in the PR |
-| 4 | `feat/m4-supabase-persistence` | SQL migrations with RLS, Storage bucket, JWT auth dependency, document CRUD, reprocess, delete, processing status, upload caps, FAISS rebuild from the database after restart, conversation persistence, per-user daily usage limits and `/usage`. | Two-user isolation tests, restart-then-query test, limit tests |
-| 5 | `feat/m5-frontend-foundation` | Vite, React and TypeScript scaffold, design system, landing page, auth screens wired to Supabase, protected routes. | Vitest, Lighthouse accessibility check, screenshots in the PR |
-| 6 | `feat/m6-dashboard-workspace` | Dashboard, library with drag-and-drop multi-upload and progress, three-pane workspace with the PDF viewer, collections, mobile tabs. | Component tests, manual run against the M4 backend |
-| 7 | `feat/m7-chat-personas` | Streaming multi-document chat, follow-ups, history, delete and new conversation, citation-to-page jump, persona settings, custom persona builder, usage meter and quota messages. **Retire `ui.py`.** | API and UI tests, persona-difference test |
-| 8 | `feat/m8-brief-quiz-flashcards-export` | Cached document brief (quick summary, takeaways, definitions), MCQ quiz with difficulty, explanations and local scoring, flashcards with flip, and PDF, DOCX and CSV export. | Schema-validated LLM output tests, cache-hit test (no second call), scoring and export tests |
-| 9 | `feat/m9-test-deploy` | Performance pass, deployment guide, Render, Vercel and Supabase configuration. Live end-to-end test of every item in your deployment checklist, on the deployed URLs, before reporting success. | Playwright smoke test on production, plus manual checklist evidence in the PR |
-
-Milestones 2–4 are backend-only and keep the Streamlit UI usable, so `main` stays demoable at every merge.
-
-## 14. Things you will need to do (no credentials in chat)
-
-- **Before Milestone 4:** create a Supabase project, enable the `vector` extension, and add its keys to a local `.env` and later to Render. I will provide exact click-paths and the SQL.
-- **Before Milestone 9:** connect the repository to Vercel and Render in their dashboards, and set environment variables there.
-- **Before Milestone 2 is tested live:** create a free Groq API key with no payment method, put it in your local `.env`, and tell me the limits your console's Limits page shows for `openai/gpt-oss-120b`.
-- **No step will ever ask you to add a payment method.** If a step seems to need one, stop and tell me.
-
-## 15. Future improvements (out of scope for v2.0)
-
-These are deliberately left out because they need many large LLM calls per use, more than the free quota can support reliably. Each one can be added later on the same architecture, through the provider adapter and the `study_items` table, if a larger free quota or a budget becomes available. **No buttons or screens will exist for them in v2.0.**
-
-| Improvement | Why deferred | What it would take |
+| Limit (configurable) | Default | Why |
 |---|---|---|
-| Detailed, executive and chapter-wise summaries; separate formula and conclusion extraction | Whole-document coverage needs about 20–60K tokens per document | Map-reduce over page groups; a higher daily quota |
-| Short- and long-answer questions with AI grading, practice tests, exam-preparation mode | Every answer submitted needs its own grading call | One grading call per answer with a rubric |
-| Multi-PDF comparison, similarity and contradiction detection | Needs paired passages from every document per topic | Topic clustering on embeddings (local) plus a paired-generation call per topic |
-| Research assistant: paper analysis, research gaps, methodology critique | Long structured outputs over full papers | Section-aware extraction plus several generation calls |
-| Document classification and concept extraction as separate features | Low value compared with their token cost | A cheap 20b call at ingest, or a local zero-shot classifier |
-| Gemini or other fallback provider | Gemini's free tier uses content for product improvement and human review | `gemini.py` adapter plus per-user opt-in (design kept in §8) |
-| Cross-provider quality evaluation | Needs keys and tokens for several providers | Run the Milestone 3 evaluation set against each provider |
-| pgvector search instead of FAISS | Not needed at demo scale | Swap `rag/vector_store.py` |
+| Max file size | 10 MB | Bounds upload time, memory and Storage use |
+| Max pages per PDF | 150 | Bounds processing time and chunk rows |
+| Max documents per user | 5 | 5 × 10 MB = 50 MB worst case per user |
+| Project Storage guard | 800 MB (80% of 1 GB) | Uploads are refused with a visible "Storage is full for this demo" error |
+| Project database guard | 400 MB (80% of 500 MB) | Same, measured with `pg_database_size` |
+
+Deleting a document removes the Storage object, its chunks, conversations and messages in one transaction, and a cleanup task removes orphaned objects. Duplicate uploads (same `sha256` for the same user) are rejected.
+
+## 5. Document processing (bounded and recoverable)
+
+**Upload:** the backend checks size, the `%PDF-` signature, page count and the guards. It stores the file, inserts the document as `queued`, and returns at once.
+
+**Processing on a host that can sleep or restart at any time:** background work is not durable on Render Free, so it is designed as a re-runnable state machine rather than a promise.
+
+1. A worker claims a `queued` document by setting `status=processing` and `lease_until = now + 10 min` in a single conditional update, so only one worker gets it.
+2. **Extract** text per page with pdfplumber. **OCR** a page only if its text is under 50 characters. OCR runs at 150 DPI, on at most 20 pages per document, with a 20-second per-page timeout. Pages beyond the cap are recorded in `ocr_pages` as skipped and shown to the user.
+3. **Chunk** and **embed** in small batches.
+4. **Write idempotently.** Inside one transaction, delete the document's existing chunks, insert the new ones, and set `status=ready`. Re-running a document always gives the same result.
+5. **Recover.** On startup, and whenever the library is listed, documents with an expired lease go back to `queued` (if `attempts < 3`) or to `failed` with the error. The UI shows the live status and a **Retry** button. The app never claims processing will finish while the service is asleep. A document left `queued` simply resumes when the service wakes.
+
+CPU-heavy steps run in a thread pool so request handling is not blocked.
+
+## 6. Retrieval (low-resource first, chosen by measurement)
+
+```
+question + persona hint terms (+ previous question when needed, §7)
+  ├─▶ semantic: top 20 by cosine similarity within the document
+  ├─▶ keyword:  top 20 by Postgres websearch_to_tsquery + ts_rank_cd within the document
+  ├─▶ RRF (k=60) → top 10
+  ├─▶ [optional Cross-Encoder rerank → top 5; off by default]
+  └─▶ context: best 4–5 passages, capped at about 1,500 tokens, tagged [C1]…[Cn] with pages
+```
+
+- **Embedding model.** The current `all-MiniLM-L6-v2` (22M parameters, 384 dimensions) is already small. Milestone 2 measures it under PyTorch CPU against an ONNX Runtime build of the same model, and keeps the lighter one if quality is equal. It loads lazily on the first upload or question and stays loaded.
+- **Semantic search strategy.** Because Q&A is one document at a time, the search space is one document's chunks (about 450 at the 150-page cap). Milestone 2 benchmarks three options for peak RSS and p50/p95 latency, and the best is selected:
+  - **(a)** pgvector exact search in Postgres, filtered by `document_id`. Nothing is held in Render RAM.
+  - **(b)** load that document's vectors from Postgres into NumPy per request, or into a small LRU of 2–3 documents.
+  - **(c)** the existing FAISS `IndexFlatIP` per document, in the same small LRU.
+
+  Full per-document indexes for all users are **never** held in RAM. No rebuild time is claimed until it is measured.
+- **Cross-Encoder** (`ms-marco-MiniLM-L-6-v2`) is behind `RERANK_ENABLED=false`. It is turned on only if the Milestone 2 benchmark shows the whole pipeline fits the free instance with headroom, and if the Milestone 3 evaluation shows it improves citation accuracy enough to justify its CPU cost.
+- **Persona effect on retrieval** is limited to adding 3–5 hint terms to the keyword query. This costs no tokens.
+
+## 7. Generation, token accounting and quota
+
+### The only LLM call in v2.0: the answer
+
+Follow-ups do **not** use an LLM rewrite. If a question is short (under 6 words) or starts with a reference word ("it", "this", "that", "they", "what about", "and"), the retrieval query becomes the previous user question plus this one. The model also sees the last 2 turns, truncated. There are no structured-output calls in v2.0, so there are no JSON repair retries.
+
+### Per-request token budget (worst case, reserved before the call)
+
+| Part | Cap (tokens) |
+|---|---|
+| System prompt (grounding and citation rules) | 220 |
+| Persona preset (compact, all 4 measured in Milestone 3) | ≤ 60 |
+| Retrieved passages (4–5 tagged passages) | ≤ 1,500 |
+| History (last 2 turns, truncated) | ≤ 400 |
+| Question | ≤ 120 |
+| **Input total** | **≤ 2,300** |
+| Answer (`max_tokens`) | 500 |
+| **Reserved per request** | **2,800** |
+| Retries | A 429 or provider error is retried at most once, after `retry-after`. A rejected request uses no tokens, but the ledger still reserves for it. A request that started and failed is charged at its actual usage. |
+
+The ledger reserves 2,800 tokens before each call, settles to the provider's reported usage afterwards, and releases unused reservation. Real per-call numbers come from the Milestone 3 workload test, and the caps are tuned from them.
+
+### Global and per-user limits
+
+- **Global cap.** `global_daily_tokens = floor(0.6 × D)`, where D is the lowest *verified* daily token limit for the chosen model, read from the account console and not from docs. The 40% headroom covers retries, settlement drift and limit changes. A per-minute cap works the same way, at 60% of the verified per-minute limit.
+- **Per-user limit** (default 15 questions per day) only stops one user from using up the shared pool. It is **not** a capacity guarantee, and the UI does not present it as one.
+- **No advertised capacity until it is measured.** After Milestone 3 the README states "expected daily answers = global cap ÷ measured p95 tokens per answer", with the measurement date and the verified limits it is based on.
+- **Kill switch.** `AI_ENABLED` (environment) and `app_settings.ai_enabled` (database) disable generation immediately.
+- **States the UI shows explicitly:**
+  - AI unavailable, for the kill switch or a provider outage.
+  - Daily limit reached, with the reset time.
+  - AI busy, try again in N seconds, for the per-minute limit or a 429.
+
+  PDF viewing, metadata, history and the search results list keep working in all of these states.
+- **Never an error as an answer.** Provider failures become typed HTTP errors. A message is stored only on success, and a failed question can be retried.
+
+### Personas (prompt presets)
+
+| Preset | Instruction (target ≤ 60 tokens) | Retrieval hints |
+|---|---|---|
+| Beginner | Plain language, define terms, one analogy if helpful | example, definition, introduction |
+| Exam Preparation | Precise definitions, key points as a list, note likely exam angles | define, important, formula, difference |
+| Researcher | Methodology, evidence, assumptions and limitations | method, results, limitation, evaluation |
+| Professional | Concise executive-style answer: conclusion first, then support | summary, recommendation, impact |
+
+## 8. LLM provider: evidence-based gate
+
+The provider is **not** fixed in advance. v2.0 ships a small adapter: one OpenAI-compatible client (`rag/llm/openai_compat.py`), configured by `LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY`, with typed errors (`RateLimited`, `QuotaExceeded`, `ProviderUnavailable`, `ModelUnavailable`, `AuthError`). Groq, Mistral and Gemini all offer OpenAI-compatible endpoints, so switching providers is a configuration change. Exactly one provider is active. There is **no automatic fallback**, so a failure never silently sends a document to a second provider.
+
+**Desk research (official pages, 2026-11-12). These are starting points only, not decisions.**
+
+| Candidate | Payment method needed for free use? | Free-tier data use, as published | Notes |
+|---|---|---|---|
+| Groq (`openai/gpt-oss-120b`, `gpt-oss-20b`) | Card only needed to upgrade | "does not retain customer data for inference requests" by default; abuse logs kept up to 30 days, can be opted out of | Docs table of limits is ambiguous between Free and Developer, so it must be read from the console |
+| Gemini Developer API (Flash, Flash-Lite) | No billing account needed; India is an available region | Free-tier content "used to improve our products"; human reviewers may read it; terms say not to submit sensitive or personal info | A usable model with a weak privacy position for user PDFs |
+| Mistral (Small) | Free API tier exists | Not stated for the free tier | Limits shown only in the console |
+| Cerebras | **Yes** (credit requires a payment method) | Not applicable | **Excluded** |
+| Cohere trial, OpenRouter `:free` | No | Varies | **Excluded:** 1,000 calls per month, or 50 requests per day |
+
+**The gate (Milestone 2 checks, Milestone 3 decides):**
+1. For each remaining candidate, **you** confirm on the actual account console: exact model ID, RPM, TPM, RPD and TPD limits, India availability, and that no payment method was requested. I verify current official pricing, structured output, data retention and deprecation notices.
+2. Run the grounded-Q&A evaluation (§10) on **public fixture PDFs only**, never on user documents, for every candidate that passes step 1. Measure citation accuracy, faithfulness, "not found" correctness, p50/p95 latency and tokens per answer.
+3. Pick the candidate with the best balance of quality, latency, privacy and verified free quota. A provider whose free tier may use or human-review inputs is chosen only if it is clearly better **and** you accept the trade-off. In that case the upload screen states plainly which provider receives passages from the document and what its policy says.
+4. Record the decision, the evidence and the date in `docs/provider-decision.md`.
+
+Until the gate is passed, development uses a fake provider in tests. Real calls use only the fixture PDFs.
+
+## 9. Resource limits on free hosting
+
+Render Free has an ephemeral filesystem and spins down after 15 minutes idle, with a cold start of about 1 minute. Its RAM and CPU are not stated on its free-tier page, so Milestone 2 reads them from the actual service. The backend must fit them with headroom. Bounds:
+
+- **Models:** lazy-loaded, one embedding model, reranker off by default, CPU-only builds, and no model downloads at request time (they are baked into the image at build).
+- **OCR:** 20 pages, 150 DPI, 20 seconds per page, and one document processed at a time.
+- **Concurrency:** one processing worker and a small request pool, so a large upload cannot starve Q&A.
+- **Cold start:** the UI shows a "Waking up the demo server…" state when `/health` is slow, instead of failing.
+- **If it does not fit,** step down in this order: switch to the ONNX embedder, keep the reranker off, use pgvector search so no vectors are held in RAM, then lower the OCR and page caps. Never upgrade the plan.
+
+## 10. Testing and acceptance
+
+- **Backend (pytest):**
+  - unit tests for extraction (text and scanned fixtures), chunk page mapping, RRF, citation validation, follow-up resolution and the token ledger;
+  - API tests with the fake provider;
+  - quota exhaustion, 429, timeout, kill switch and invalid-model tests;
+  - the cross-user isolation suite against a real Supabase test project.
+- **Frontend:** Vitest and React Testing Library for components and states, including "AI unavailable", "limit reached" and "waking up". One Playwright smoke test: sign up → upload → wait for ready → ask → open citation.
+- **Repeatable workload test** (`backend/scripts/workload.py`). It runs 3 fixture PDFs (text, mixed and scanned) and about 20 realistic questions, and records:
+  - tokens in and out per call;
+  - p50/p95 answer latency;
+  - peak RSS;
+  - OCR and total processing time per document;
+  - Storage and database growth per document;
+  - retrieval recall@5 and citation accuracy against gold pages;
+  - behaviour under forced 429s and quota exhaustion.
+
+  It runs locally in Milestones 2–3, and again against the deployed free services in Milestone 7.
+- **Deployment acceptance (Milestone 7):** the deployed app passes the smoke test and the isolation suite. The workload results are attached to the PR, and the README states expected daily capacity from measured tokens and console-confirmed limits, with the safety margin applied.
+
+## 11. Milestones (7)
+
+Each milestone uses its own branch from the latest `main`, has its own PR to `main` on `ChinmayeePrasad327/PersonaLens`, and waits for your review and merge before the next one starts.
+
+| # | Branch | Delivers | Exit criteria |
+|---|---|---|---|
+| 1 | `docs/m1-audit-architecture` | This audit and plan. After your approval, in the same PR: `.env.example`, a fuller `.gitignore`, a README that describes only what exists plus the local demo path, and a pytest scaffold with CI (lint and test). | CI green |
+| 2 | `feat/m2-backend-hardening` | `git mv` into `backend/app/`. Fixes the audit's C1–C3, H1, M1–M4, S3, S4 and S6. Page-aware chunk metadata, bounded OCR, upload validation, `/health`, settings, the provider adapter with typed errors (fake provider in tests), CPU-only pinned requirements and a Dockerfile with Tesseract. **Resource benchmark** of the embedder (Torch vs ONNX) and the three search options, on a free Render instance. Provider gate step 1. `ui.py` keeps working. | Tests pass; benchmark report in the PR with the chosen options |
+| 3 | `feat/m3-retrieval-citations` | Keyword + semantic retrieval with RRF, optional reranker, token-capped context, citation tagging and validation, deterministic follow-ups, the 4 persona presets, and the token ledger logic. Evaluation set and **provider gate steps 2–4**. | Recall@5, citation accuracy and tokens per answer reported; provider decision recorded |
+| 4 | `feat/m4-auth-persistence-quotas` | Supabase migrations with RLS, Storage bucket and policies, JWT auth, document CRUD with the recoverable processing state machine, conversation history, Storage and database guards, global and per-user quotas, kill switch, `/usage`. | Isolation suite passes; restart-mid-processing test; quota-exhaustion test |
+| 5 | `feat/m5-frontend-foundation` | Vite + React + TypeScript, Tailwind design system, landing page, auth screens, protected routes, and the "waking up" and error states. `ui.py` is retired once Milestone 6 reaches parity. | Vitest; accessibility check; screenshots |
+| 6 | `feat/m6-library-workspace` | Library (upload with progress, status, retry, delete), workspace (PDF viewer, single-document Q&A, citations that jump to the page, passage previews, history, persona selector), usage meter and quota states, answer copy and Markdown download. **Retire `ui.py`.** | Component tests; manual run against the Milestone 4 backend |
+| 7 | `feat/m7-test-deploy` | Deploy to Render Free, Vercel Hobby and Supabase Free. Deployment guide, workload test on the deployed services, final cost and quota audit, README capacity statement and demo caveats. | Smoke test and isolation suite pass on production; workload report attached. **No deployment claim without this evidence.** |
+
+## 12. Future improvements (not in v2.0)
+
+Each item below is excluded because of its token cost or infrastructure cost on free tiers. The architecture leaves room for each one (the adapter, the `documents` and `chunks` model, and the quota ledger) without building it now.
+
+| Improvement | Added LLM token cost | Added infrastructure or resource cost |
+|---|---|---|
+| Multi-document chat | Larger context: about 1.5–2× input per answer to keep per-document diversity | Searching across several documents: more vectors in memory or larger pgvector scans |
+| Collections | None | More tables and UI; low risk, mostly product scope |
+| Custom personas | Longer and unbounded system prompts (must be capped and counted) | A table plus a builder UI, and validation |
+| LLM follow-up rewriting | +1 small call per follow-up (about 300–500 tokens) | None |
+| Document brief (quick summary, takeaways, definitions) | About 4–6K per document, once (cached) | Cache table |
+| Detailed, executive and chapter-wise summaries | About 20–60K per document (map-reduce) | Long jobs on a sleeping host need durable job tracking |
+| Quizzes and flashcards | About 3–5K per set, plus JSON repair retries | Storage of sets and attempts; scoring UI |
+| Short- and long-answer grading, exam mode | +1 call per submitted answer | Attempt history |
+| Multi-PDF comparison, contradictions | Paired generation per topic, often 10K+ per comparison | Topic clustering across documents (CPU) |
+| Research assistant (paper analysis, gaps, methodology) | Several long structured calls per paper | Section detection |
+| Document classification, concept extraction | About 1K per document at ingest | Small |
+| DOCX, PDF and CSV export | None | Server-side rendering libraries, CPU and bandwidth |
+| Second or fallback LLM provider | None extra, but sends user passages to another party | Explicit per-user opt-in with a privacy disclosure; never automatic |
+| Cross-Encoder on by default | None | About 100 MB or more of RAM and extra CPU per query; depends on the benchmark |
+| Batch multi-file upload | None | Concurrent processing load on a single small instance |

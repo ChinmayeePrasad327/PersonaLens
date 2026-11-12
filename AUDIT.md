@@ -121,14 +121,16 @@ Severity: **Critical** = broken or unsafe now. **High** = blocks a 2.0 requireme
 
 ### 3.7 Deployment limitations
 
-These were checked against the providers' own pages on 2026-11-12. They will be re-checked in Milestone 9.
+These were checked against the providers' own pages on 2026-11-12. They will be re-checked in Milestones 2 and 7.
 
 - **Render free web services** have an ephemeral filesystem, lost on every restart, redeploy or spin-down. They spin down after 15 minutes idle, with a cold start of about 1 minute, and have no persistent disks ([render.com/docs/free](https://render.com/docs/free)). **Any index kept only in memory or on local disk will disappear**, so indexes must be rebuildable from Supabase.
-- **Memory is the main deployment risk.** torch, MiniLM and a Cross-Encoder together take several hundred MB of RAM. Render's free instance size is not stated on the free-tier docs page and must be confirmed. If it is the commonly cited 512 MB, this stack will not fit without changes. See `ARCHITECTURE.md` §9. Under the ₹0 rule a paid instance is not an option.
+- **Memory is the main deployment risk.** torch, MiniLM and a Cross-Encoder together take several hundred MB of RAM. Render's free instance size is not stated on the free-tier docs page and must be confirmed. If it is the commonly cited 512 MB, this stack may not fit without changes. `ARCHITECTURE.md` §6 and §9 make the reranker optional and off by default, and require a measured benchmark on the free instance. Under the ₹0 rule a paid instance is not an option.
 - **Supabase Free** allows 500 MB of database, 1 GB of storage, uploads up to 50 MB and 2 active projects. **Projects pause after 1 week of inactivity**, and backups are not included ([supabase.com/pricing](https://supabase.com/pricing)). Storing 384-dimensional embeddings costs about 1.5 KB per chunk, which comfortably fits a demo.
 - Tesseract must be installed in the Render image, which means a Docker deploy or a build script.
 
-## 4. Persona coverage versus the 2.0 target
+## 4. Persona coverage versus the original 2.0 request
+
+v2.0 now ships only 4 compact presets (see `ARCHITECTURE.md` §7). The fuller set below is a future improvement.
 
 | Target | Today |
 |---|---|
@@ -145,15 +147,15 @@ These were checked against the providers' own pages on 2026-11-12. They will be 
 | `pdf_processor.py` | **Improve** | Return per-page records `(page_no, text, method)`. Keep the OCR fallback but base the trigger on text and image coverage. Stop dropping short lines. Add size and page limits. |
 | `chunker.py` | **Improve** | Make it page-aware and sentence-aware with overlap. Each chunk carries `doc_id`, `filename`, `page_start`, `page_end`, `chunk_id` and `text`. |
 | `embeddings.py` | **Preserve and refactor** | Same model, lazy singleton, explicit normalisation, batch encoding. |
-| `vector_store.py` | **Improve** | Keep FAISS (`IndexFlatIP`), but per document and rebuildable from embeddings persisted in Supabase. Add metadata and delete. |
-| `relevance.py` | **Replace** | Replace with hybrid retrieval (FAISS + Postgres full-text), reciprocal-rank fusion, Cross-Encoder reranking and persona-aware query shaping. |
-| `personas.py` | **Preserve and extend** | Keep the data model and add the missing personas, generation parameters and custom personas. |
-| `generator.py` | **Replace the client layer, keep the prompt logic** | A provider-agnostic adapter chosen by configuration (Groq is recommended on the ₹0 analysis in `ARCHITECTURE.md` §8), typed errors instead of error strings, citation-tagged context, conversation history. |
+| `vector_store.py` | **Improve or replace, by measurement** | Embeddings persist in Supabase. Semantic search is chosen in Milestone 2 by measured RAM and latency: pgvector in Postgres, NumPy over one document's vectors, or the existing FAISS in a small LRU. No all-user indexes in RAM. |
+| `relevance.py` | **Replace** | Hybrid retrieval (semantic + Postgres full-text) with reciprocal-rank fusion, persona hint terms, and an optional Cross-Encoder that is off by default. |
+| `personas.py` | **Simplify** | Replace with 4 compact prompt presets (Beginner, Exam Preparation, Researcher, Professional). The full hierarchy and custom personas are future improvements. |
+| `generator.py` | **Replace the client layer, keep the prompt logic** | A provider-agnostic adapter chosen by configuration (provider chosen through the evidence gate in `ARCHITECTURE.md` §8), typed errors instead of error strings, citation-tagged context, conversation history. |
 | `app.py` | **Restructure** | Move into `backend/app/` with routers, Pydantic schemas, auth dependency, thread-pooled CPU work, and a `/health` route. |
-| `ui.py` (Streamlit) | **Keep working, then retire** | Keep it runnable against the new API until the React chat reaches parity (Milestone 7), then remove it. |
+| `ui.py` (Streamlit) | **Keep working, then retire** | Keep it runnable against the new API until the React workspace reaches parity (Milestone 6), then remove it. |
 | `README.md` | **Rewrite** | Describe only what exists. |
 | `requirements.txt` | **Fix** | Add `groq`, remove `openai`, pin versions, CPU-only torch. |
 
 ## 6. Summary
 
-PersonaLens has a sound, readable pipeline skeleton, but it is a single-user prototype. Today it fails on a fresh install (C2), at startup without a key (C3), and at answer time because its model is retired (C1). It has no chunk metadata, so citations cannot exist (R1–R3), and it shares one global index across all users (S1). These are fixable without discarding the design. The modules map one-to-one onto the planned `backend/app/rag/` and `document_processing/` packages, and Milestones 2–4 address every Critical and High finding above before any UI work begins. Milestones 2–3 fix the pipeline findings. The cross-user exposure (S1) and missing authentication (S2) are fixed only in Milestone 4, so no public deployment should happen before Milestone 4 is merged.
+PersonaLens has a sound, readable pipeline skeleton, but it is a single-user prototype. Today it fails on a fresh install (C2), at startup without a key (C3), and at answer time because its model is retired (C1). It has no chunk metadata, so citations cannot exist (R1–R3), and it shares one global index across all users (S1). These are fixable without discarding the design. The modules map one-to-one onto the planned `backend/app/rag/` and `document_processing/` packages, and Milestones 2–4 address every Critical and High finding above before any UI work begins. Milestones 2–3 fix the pipeline findings. The cross-user exposure (S1) and missing authentication (S2) are fixed only in Milestone 4, so no public deployment should happen until the Milestone 4 isolation suite passes. Deployment itself is Milestone 7.
